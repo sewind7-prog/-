@@ -8,6 +8,9 @@ const { pathToFileURL } = require('url')
 
 let mainWindow
 let exportProcess
+const proxyJobs = new Map()
+const proxyQueue = []
+let activeProxyPath = null
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'cutflow-media', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }])
 
@@ -51,6 +54,35 @@ function ffmpegPath() {
   return require('ffmpeg-static')
 }
 
+const BUILT_IN_LUTS = {
+  'sony-slog3': 'sony-slog3-sgamut3cine-rec709.cube',
+  'sony-slog2': 'sony-slog2-sgamut-rec709.cube',
+  'panasonic-vlog': 'panasonic-vlog-vgamut-v709.cube'
+}
+
+function bundledLutPath(fileName) {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'luts', fileName)
+    : path.join(__dirname, '..', 'assets', 'luts', fileName)
+}
+
+function resolveLutPath(lut) {
+  if (!lut || lut.preset === 'none') return null
+  const builtInName = BUILT_IN_LUTS[lut.preset]
+  const resolved = lut.preset === 'custom' ? lut.path : builtInName ? bundledLutPath(builtInName) : null
+  if (!resolved || path.extname(resolved).toLowerCase() !== '.cube' || !fs.existsSync(resolved)) {
+    throw new Error('LUT 文件不存在或不是 .cube 格式')
+  }
+  return resolved
+}
+
+function lutFilter(lut) {
+  const lutPath = resolveLutPath(lut)
+  if (!lutPath) return null
+  const escaped = lutPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
+  return `lut3d=file='${escaped}':interp=tetrahedral`
+}
+
 ipcMain.handle('open-videos', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile', 'multiSelections'],
@@ -80,6 +112,14 @@ ipcMain.handle('choose-output-dir', async () => {
   return result.canceled ? null : result.filePaths[0]
 })
 
+ipcMain.handle('choose-lut', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [{ name: '3D LUT', extensions: ['cube'] }]
+  })
+  return result.canceled ? null : result.filePaths[0]
+})
+
 function inspectMedia(filePath) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath(), ['-hide_banner', '-i', filePath], { windowsHide: true })
@@ -100,35 +140,77 @@ function inspectMedia(filePath) {
   })
 }
 
+function startNextPreviewProxy() {
+  if (activeProxyPath || !proxyQueue.length) return
+  const { filePath, info, previewPath } = proxyQueue.shift()
+  activeProxyPath = filePath
+  const partialPath = `${previewPath}.partial-${crypto.randomUUID()}`
+  const args = info.mediaType === 'video'
+    ? ['-y', '-hide_banner', '-loglevel', 'error', '-i', filePath, '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=w=min(960\\,iw):h=-2', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '29', '-pix_fmt', 'yuv420p', '-g', '1', '-keyint_min', '1', '-sc_threshold', '0', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4', partialPath]
+    : ['-y', '-hide_banner', '-loglevel', 'error', '-i', filePath, '-vn', '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2', '-f', 'wav', partialPath]
+  const proc = spawn(ffmpegPath(), args, { windowsHide: true })
+  proxyJobs.set(filePath, proc)
+  let error = ''
+  proc.stderr.on('data', chunk => { error += chunk.toString() })
+  proc.on('error', proxyError => {
+    proxyJobs.delete(filePath)
+    activeProxyPath = null
+    fs.rmSync(partialPath, { force: true })
+    mainWindow?.webContents.send('media-proxy-ready', { path: filePath, error: proxyError.message })
+    startNextPreviewProxy()
+  })
+  proc.on('close', code => {
+    if (!proxyJobs.has(filePath)) return
+    proxyJobs.delete(filePath)
+    activeProxyPath = null
+    if (code === 0 && fs.existsSync(partialPath) && fs.statSync(partialPath).size > 0) {
+      fs.renameSync(partialPath, previewPath)
+      mainWindow?.webContents.send('media-proxy-ready', { path: filePath, previewPath, previewBytes: fs.statSync(previewPath).size })
+    } else {
+      fs.rmSync(partialPath, { force: true })
+      mainWindow?.webContents.send('media-proxy-ready', { path: filePath, error: error.slice(-600) || '预览代理生成失败' })
+    }
+    startNextPreviewProxy()
+  })
+}
+
+function createPreviewProxy(filePath, info, previewPath) {
+  if (proxyJobs.has(filePath)) return
+  proxyJobs.set(filePath, null)
+  proxyQueue.push({ filePath, info, previewPath })
+  startNextPreviewProxy()
+}
+
 ipcMain.handle('prepare-media', async (_, filePath) => {
   try {
     const info = await inspectMedia(filePath)
-    // Every video gets an editing proxy with dense keyframes. This makes frame scrubbing
-    // responsive even when the camera original has a long GOP structure.
-    const needsVideoProxy = info.mediaType === 'video'
+    const extension = path.extname(filePath).toLowerCase()
+    const nativeVideo = ['.mp4', '.m4v', '.mov', '.webm'].includes(extension) && ['h264', 'vp8', 'vp9', 'av1'].includes(info.codec)
+    const needsVideoProxy = info.mediaType === 'video' && !nativeVideo
     const needsAudioProxy = info.mediaType === 'audio' && ['flac', 'alac', 'pcm_s24le', 'pcm_s32le'].includes(info.codec)
     if (!needsVideoProxy && !needsAudioProxy) return { ok: true, ...info, previewPath: filePath, proxied: false }
     const stat = fs.statSync(filePath)
-    const key = crypto.createHash('sha1').update(`proxy-v3-intraframe:${filePath}:${stat.size}:${stat.mtimeMs}`).digest('hex')
+    const key = crypto.createHash('sha1').update(`proxy-v4-background:${filePath}:${stat.size}:${stat.mtimeMs}`).digest('hex')
     const cacheDir = path.join(app.getPath('userData'), 'preview-cache')
     fs.mkdirSync(cacheDir, { recursive: true })
     const previewPath = path.join(cacheDir, `${key}.${info.mediaType === 'video' ? 'mp4' : 'wav'}`)
     const cachedPreviewValid = fs.existsSync(previewPath) && fs.statSync(previewPath).size > 0
-    if (!cachedPreviewValid) {
-      const args = info.mediaType === 'video'
-        ? ['-i', filePath, '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=w=min(960\\,iw):h=-2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p', '-g', '1', '-keyint_min', '1', '-sc_threshold', '0', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', previewPath]
-        : ['-i', filePath, '-vn', '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2', previewPath]
-      await runFfmpeg(args, info.duration)
-    }
-    const previewBytes = fs.statSync(previewPath).size
-    return { ok: true, ...info, previewPath, previewBytes, proxied: true }
+    if (cachedPreviewValid) return { ok: true, ...info, previewPath, previewBytes: fs.statSync(previewPath).size, proxied: true }
+    createPreviewProxy(filePath, info, previewPath)
+    return { ok: true, ...info, previewPath: filePath, proxied: false, proxyPending: true }
   } catch (error) { return { ok: false, error: error.message } }
 })
 
 ipcMain.handle('get-thumbnail', async (_, { path: filePath, at }) => {
   const tempFile = path.join(os.tmpdir(), `cutflow-thumb-${crypto.randomUUID()}.jpg`)
   try {
-    await runFfmpeg(['-ss', String(Math.max(0, at)), '-i', filePath, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '3', tempFile], 1)
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath(), ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(Math.max(0, at)), '-i', filePath, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '3', tempFile], { windowsHide: true })
+      let error = ''
+      proc.stderr.on('data', chunk => { error += chunk.toString() })
+      proc.on('error', reject)
+      proc.on('close', code => code === 0 ? resolve() : reject(new Error(error || '首帧提取失败')))
+    })
     return { ok: true, dataUrl: `data:image/jpeg;base64,${fs.readFileSync(tempFile).toString('base64')}` }
   } catch (error) { return { ok: false, error: error.message } }
   finally { fs.rmSync(tempFile, { force: true }) }
@@ -285,7 +367,7 @@ ipcMain.handle('export-media', async (_, payload) => {
         const duration = Math.max(0.01, clip.end - clip.start)
         const color = `color=c=black:s=${targetSize.width}x${targetSize.height}:r=${Number(settings.fps) || 30}:d=${duration}`
         const args = ['-ss', String(clip.start), '-i', clip.path, '-f', 'lavfi', '-i', color, '-t', String(duration),
-          '-map', '1:v:0', '-map', '0:a:0', '-c:v', 'libx264', '-preset', 'medium', '-b:v', `${videoBitrate}k`,
+          '-map', '1:v:0', '-map', '0:a:0', '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${videoBitrate}k`,
           '-r', String(settings.fps || 30), '-pix_fmt', 'yuv420p', '-af', audioFilter(clip, settings),
           '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart', file]
         await runFfmpeg(args, duration)
@@ -293,6 +375,8 @@ ipcMain.handle('export-media', async (_, payload) => {
         continue
       }
       const vf = []
+      const activeLut = lutFilter(clip.lut || settings.globalLut)
+      if (activeLut) vf.push(activeLut)
       const transform = clip.transform || { scale: 100, rotation: 0, flipH: false, flipV: false, x: 0, y: 0 }
       if (transform.rotation === 90) vf.push('transpose=1')
       if (transform.rotation === 180) vf.push('transpose=1,transpose=1')
@@ -318,7 +402,7 @@ ipcMain.handle('export-media', async (_, payload) => {
       }
       vf.push('setsar=1', 'format=yuv420p')
       const args = ['-ss', String(clip.start), '-t', String(clip.end - clip.start), '-i', clip.path,
-        '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'medium', '-b:v', `${videoBitrate}k`,
+        '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${videoBitrate}k`,
         '-r', String(settings.fps || 30), '-af', audioFilter(clip, settings),
         '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-movflags', '+faststart', file]
       await runFfmpeg(args, clip.end - clip.start)
@@ -338,7 +422,7 @@ ipcMain.handle('export-media', async (_, payload) => {
         filters.push(`${audioIn}[${i}:a]acrossfade=d=${duration}:c1=tri:c2=tri[a${i}]`)
         videoIn = `[v${i}]`; audioIn = `[a${i}]`; elapsed += clips[i].end - clips[i].start - duration
       }
-      args.push('-filter_complex', filters.join(';'), '-map', videoIn, '-map', audioIn, '-c:v', 'libx264', '-b:v', `${videoBitrate}k`, '-pix_fmt', 'yuv420p', '-preset', 'medium', '-c:a', 'aac', '-movflags', '+faststart', merged)
+      args.push('-filter_complex', filters.join(';'), '-map', videoIn, '-map', audioIn, '-c:v', 'libx264', '-b:v', `${videoBitrate}k`, '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', merged)
       await runFfmpeg(args, elapsed)
     } else await runFfmpeg(['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', merged], clips.reduce((n,c) => n+c.end-c.start, 0))
     if (mode === 'video') fs.copyFileSync(merged, output)

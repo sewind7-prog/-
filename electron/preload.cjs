@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('cutflow', {
   openMedia: () => ipcRenderer.invoke('open-media'),
   openAudio: () => ipcRenderer.invoke('open-audio'),
   chooseOutputDir: () => ipcRenderer.invoke('choose-output-dir'),
+  chooseLut: () => ipcRenderer.invoke('choose-lut'),
   prepareMedia: path => ipcRenderer.invoke('prepare-media', path),
   getThumbnail: (path, at = 0) => ipcRenderer.invoke('get-thumbnail', { path, at }),
   getWaveform: (path, points = 1600) => ipcRenderer.invoke('get-waveform', { path, points }),
@@ -16,6 +17,11 @@ contextBridge.exposeInMainWorld('cutflow', {
     const listener = (_, value) => callback(value)
     ipcRenderer.on('export-progress', listener)
     return () => ipcRenderer.removeListener('export-progress', listener)
+  },
+  onProxyReady: (callback) => {
+    const listener = (_, value) => callback(value)
+    ipcRenderer.on('media-proxy-ready', listener)
+    return () => ipcRenderer.removeListener('media-proxy-ready', listener)
   },
   windowMinimize: () => ipcRenderer.invoke('window-control', 'minimize'),
   windowMaximize: () => ipcRenderer.invoke('window-control', 'maximize'),

@@ -14,6 +14,7 @@ const api = window.cutflow || {
   openMedia: async () => [],
   openAudio: async () => [],
   chooseOutputDir: async () => null,
+  chooseLut: async () => null,
   prepareMedia: async path => ({ ok: true, previewPath: path }),
   getThumbnail: async () => ({ ok: false }),
   getWaveform: async () => ({ ok: false }),
@@ -21,6 +22,7 @@ const api = window.cutflow || {
   exportMedia: async () => ({ ok: false, error: '请在桌面应用中运行' }),
   cancelExport: async () => {},
   onProgress: () => () => {},
+  onProxyReady: () => () => {},
   windowMinimize: () => {},
   windowMaximize: () => {},
   windowClose: () => {}
@@ -31,6 +33,9 @@ const AUDIO_EXT = /\.(mp3|wav|m4a|aac|flac|ogg)$/i
 const fileName = path => path.split(/[\\/]/).pop()
 const baseName = path => fileName(path).replace(/\.[^.]+$/, '')
 const safeName = value => (value || '时间轴').replace(/[<>:"/\\|?*]/g, '_').trim() || '时间轴'
+const outputBaseName = (timeline, namingMode) => safeName(namingMode === 'firstClip'
+  ? baseName(timeline?.clips?.[0]?.name || timeline?.name)
+  : timeline?.name)
 const fmt = seconds => {
   const value = Math.max(0, Number(seconds) || 0)
   return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(Math.floor(value % 60)).padStart(2, '0')}.${Math.floor(value % 1 * 10)}`
@@ -318,6 +323,20 @@ function useMediaTimeController({ clip, marks, setTime, setPlaying, setPreviewSt
     }
     try { await element.play() } catch (error) { show(`无法播放：${error.message}`) }
   }
+  const playFromIn = async () => {
+    const activeClip = clipRef.current
+    const element = activeElement()
+    if (!activeClip || !element || element.dataset.clipId !== activeClip.id) return
+    if (!element.paused) return element.pause()
+    const entry = Math.max(activeClip.start, marksRef.current.in ?? activeClip.start)
+    const exit = Math.min(activeClip.end, marksRef.current.out ?? activeClip.end)
+    if (exit - entry < 0.04) return show('入出点区间太短，无法播放')
+    settlingTargetRef.current = entry
+    seekTo(entry, { commit: true, immediate: true })
+    await waitForPosition(entry)
+    settlingTargetRef.current = null
+    try { await element.play() } catch (error) { show(`无法播放：${error.message}`) }
+  }
   const loadClip = nextClip => {
     pause()
     cancelAnimationFrame(writeFrameRef.current)
@@ -374,7 +393,7 @@ function useMediaTimeController({ clip, marks, setTime, setPlaying, setPreviewSt
     return () => listenersRef.current.delete(listener)
   }
   return {
-    videoRef, audioRef, seekTo, beginScrub, endScrub, pause, toggle,
+    videoRef, audioRef, seekTo, beginScrub, endScrub, pause, toggle, playFromIn,
     loadClip, clearMedia, subscribe, onPlay, onPause, onTimeUpdate,
     onSeeked, onLoadedMetadata, onLoadedData, onCanPlay, onError,
     getTime: () => timeRef.current,
@@ -403,8 +422,9 @@ function App() {
   const [settings, setSettings] = useState({
     ratio: 'original', ratioMode: 'crop', resolution: '1080p', fps: 30,
     bitrate: 8000, audioFormat: 'mp3', audioBitrate: 192,
-    outputDir: '', saveMode: 'ask', normalizeAudio: false,
-    loudnessTarget: -16, masterGainDb: 0
+    outputDir: '', saveMode: 'ask', namingMode: 'timeline', normalizeAudio: false,
+    loudnessTarget: -16, masterGainDb: 0, transformScope: 'selected', lutScope: 'selected',
+    globalLut: { preset: 'none', path: '', name: '无' }
   })
 
   const activeTimeline = timelines.find(item => item.id === activeTimelineId) || timelines[0]
@@ -441,6 +461,20 @@ function App() {
   }
 
   useEffect(() => api.onProgress(setProgress), [])
+
+  useEffect(() => api.onProxyReady(result => {
+    if (!result?.path) return
+    if (result.error) {
+      setTimelines(old => old.map(timeline => ({ ...timeline, clips: timeline.clips.map(clip => clip.path === result.path ? { ...clip, proxyPending: false, proxyError: result.error } : clip) })))
+      return
+    }
+    setTimelines(old => old.map(timeline => ({
+      ...timeline,
+      clips: timeline.clips.map(clip => clip.path === result.path
+        ? { ...clip, previewPath: result.previewPath, proxied: true, proxyPending: false, proxyError: null }
+        : clip)
+    })))
+  }), [])
 
   useEffect(() => {
     const change = event => setTimelines(old => old.map(timeline => ({
@@ -504,7 +538,8 @@ function App() {
       id: crypto.randomUUID(), path, previewPath: prepared.previewPath || path,
       name: fileName(path), mediaType, width: prepared.width, height: prepared.height,
       duration: prepared.duration || 0, start: 0, end: prepared.duration || 0,
-      visual: null, proxied: prepared.proxied, gainDb: 0,
+      visual: null, proxied: prepared.proxied, proxyPending: prepared.proxyPending, gainDb: 0,
+      lut: { preset: 'none', path: '', name: '无' },
       transition: { type: 'none', duration: 0.5 },
       transform: { scale: 100, rotation: 0, flipH: false, flipV: false, x: 0, y: 0 }
     }
@@ -587,6 +622,25 @@ function App() {
   const updateCurrent = patch => setClips(old => old.map(clip => clip.id === selected ? { ...clip, ...patch } : clip))
   const updateTransform = patch => current && updateCurrent({ transform: { ...current.transform, ...patch } })
   const resetTransform = () => updateTransform({ scale: 100, rotation: 0, flipH: false, flipV: false, x: 0, y: 0 })
+  const updateTransformScoped = patch => {
+    if (!current || current.mediaType !== 'video') return
+    if (settings.transformScope === 'all') {
+      setTimelines(old => old.map(timeline => ({
+        ...timeline,
+        clips: timeline.clips.map(clip => clip.mediaType === 'video' ? { ...clip, transform: { ...clip.transform, ...patch } } : clip)
+      })))
+    } else updateTransform(patch)
+  }
+  const resetTransformScoped = () => updateTransformScoped({ scale: 100, rotation: 0, flipH: false, flipV: false, x: 0, y: 0 })
+  const applyLut = lut => {
+    if (!current || current.mediaType !== 'video') return
+    if (settings.lutScope === 'all') {
+      setTimelines(old => old.map(timeline => ({
+        ...timeline,
+        clips: timeline.clips.map(clip => clip.mediaType === 'video' ? { ...clip, lut } : clip)
+      })))
+    } else updateCurrent({ lut })
+  }
 
   const split = () => {
     const locatedTime = controller.getTime()
@@ -703,9 +757,13 @@ function App() {
     if (ready.length > 1 && !directory) return
     setExporting(true)
     setProgress(0)
+    const usedNames = new Map()
     for (let index = 0; index < ready.length; index += 1) {
       const timeline = ready[index]
-      const name = safeName(timeline.name)
+      const baseOutputName = outputBaseName(timeline, settings.namingMode)
+      const duplicateIndex = usedNames.get(baseOutputName) || 0
+      usedNames.set(baseOutputName, duplicateIndex + 1)
+      const name = duplicateIndex ? `${baseOutputName}_${duplicateIndex + 1}` : baseOutputName
       const output = directory
         ? `${directory}${directory.includes('\\') ? '\\' : '/'}${name}.${extension}`
         : await api.chooseOutput(mode, settings.audioFormat, name)
@@ -744,6 +802,8 @@ function App() {
       split,
       removeSelected: () => current && removeClip(activeTimeline.id, current.id),
       transform: patch => updateTransform(patch),
+      setClipLut: (clipId, lut) => setTimelines(old => old.map(timeline => ({ ...timeline, clips: timeline.clips.map(clip => clip.id === clipId ? { ...clip, lut } : clip) }))),
+      outputName: (timelineId, namingMode) => outputBaseName(timelines.find(timeline => timeline.id === timelineId), namingMode),
       toggle: controller.toggle,
       pause: controller.pause,
       exportActive: (output, mode, overrides = {}) => api.exportMedia({
@@ -764,7 +824,7 @@ function App() {
               duration: item.duration, proxied: item.proxied,
               visualReady: item.mediaType === 'video' ? /^data:image\/jpeg/.test(item.visual || '') : Boolean(item.visual?.length),
               visualPoints: Array.isArray(item.visual) ? item.visual.length : 0,
-              visualError: item.visualError || null, transform: item.transform
+              visualError: item.visualError || null, transform: item.transform, lut: item.lut
             }))
           })),
           video: {
@@ -815,7 +875,7 @@ function App() {
 
         <>
           <div className="controls">
-            <button disabled={!current} onClick={toggle}>{playing ? <Pause/> : <Play/>}</button>
+            <button disabled={!current} onClick={playing ? controller.pause : controller.playFromIn}>{playing ? <Pause/> : <Play/>}</button>
             <TimeReadout controller={controller} fallback={time}/>
             <PrecisionScrubber clip={current} time={time} marks={marks} setMarks={setMarks} controller={controller}/>
             <span>{fmt(current?.end || 0)}</span>
@@ -871,7 +931,7 @@ function App() {
       </section>
       <ExportPanelV2
         settings={settings} setSettings={setSettings} current={current}
-        updateCurrent={updateCurrent} updateTransform={updateTransform} resetTransform={resetTransform}
+        updateCurrent={updateCurrent} updateTransform={updateTransformScoped} resetTransform={resetTransformScoped} applyLut={applyLut}
         timelines={timelines} exporting={exporting} progress={progress} doExport={doExport}
       />
     </main>
@@ -955,12 +1015,15 @@ function VideoPreview({ clip, visible, controller, ratio, ratioMode, updateTrans
 function PrecisionScrubber({ clip, time, marks, setMarks, controller }) {
   const progressRef = useRef(null)
   const rangeRef = useRef(null)
+  const playheadRef = useRef(null)
   const inRef = useRef(null)
   const outRef = useRef(null)
   const draftRef = useRef(marks)
   const activeRef = useRef(null)
-  draftRef.current = activeRef.current ? draftRef.current : marks
-  useEffect(() => controller.subscribe(value => { if (progressRef.current) progressRef.current.value = value }), [controller, clip?.id])
+  useEffect(() => controller.subscribe(value => {
+    if (progressRef.current) progressRef.current.value = value
+    if (playheadRef.current && clip) playheadRef.current.style.left = `${pct(value)}%`
+  }), [controller, clip?.id, clip?.start, clip?.end])
   const start = clip?.start ?? 0
   const end = clip?.end ?? 1
   const span = Math.max(0.001, end - start)
@@ -979,7 +1042,12 @@ function PrecisionScrubber({ clip, time, marks, setMarks, controller }) {
   if (!clip) return <div className="precision-scrubber disabled"/>
   const begin = kind => {
     activeRef.current = kind
-    draftRef.current = { ...marks }
+    const currentIn = Number(inRef.current?.value)
+    const currentOut = Number(outRef.current?.value)
+    draftRef.current = {
+      in: Number.isFinite(currentIn) ? currentIn : (marks.in ?? clip.start),
+      out: Number.isFinite(currentOut) ? currentOut : (marks.out ?? clip.end)
+    }
     controller.beginScrub()
   }
   const finish = () => {
@@ -1004,6 +1072,7 @@ function PrecisionScrubber({ clip, time, marks, setMarks, controller }) {
   return <div className="precision-scrubber">
     <div className="scrub-base"/>
     <div ref={rangeRef} className="marked-range" style={{ left: `${pct(marks.in ?? clip.start)}%`, width: `${Math.max(0, pct(marks.out ?? clip.end) - pct(marks.in ?? clip.start))}%` }}/>
+    <span ref={playheadRef} className="playhead-marker" style={{ left: `${pct(time)}%` }}/>
     <input ref={progressRef} data-role="progress-range" className="scrub-range" type="range" {...common} defaultValue={time} onPointerDown={() => begin('progress')} onInput={progressInput} onPointerUp={finish} onPointerCancel={finish} onKeyDown={() => begin('progress')} onKeyUp={finish} onBlur={finish}/>
     <input ref={inRef} data-role="in-range" aria-label="入点" className="mark-range mark-range-in" type="range" {...common} defaultValue={marks.in ?? clip.start} onPointerDown={event => { event.stopPropagation(); begin('in') }} onInput={event => markInput('in', event)} onPointerUp={finish} onPointerCancel={finish} onKeyDown={() => begin('in')} onKeyUp={finish} onBlur={finish}/>
     <input ref={outRef} data-role="out-range" aria-label="出点" className="mark-range mark-range-out" type="range" {...common} defaultValue={marks.out ?? clip.end} onPointerDown={event => { event.stopPropagation(); begin('out') }} onInput={event => markInput('out', event)} onPointerUp={finish} onPointerCancel={finish} onKeyDown={() => begin('out')} onKeyUp={finish} onBlur={finish}/>
@@ -1148,12 +1217,18 @@ function DbControl({ value, onChange }) {
   </div>
 }
 
-function ExportPanelV2({ settings, setSettings, current, updateCurrent, updateTransform, resetTransform, timelines, exporting, progress, doExport }) {
+function ExportPanelV2({ settings, setSettings, current, updateCurrent, updateTransform, resetTransform, applyLut, timelines, exporting, progress, doExport }) {
   const set = patch => setSettings({ ...settings, ...patch })
   const hasVideo = current?.mediaType === 'video'
   const hasAudio = Boolean(current)
   const hasMedia = Boolean(current)
   const transform = current?.transform || { scale: 100, rotation: 0, flipH: false, flipV: false, x: 0, y: 0 }
+  const selectedLut = current?.lut || { preset: 'none', path: '', name: '无' }
+  const chooseCustomLut = async () => {
+    const lutPath = await api.chooseLut()
+    if (!lutPath) return
+    applyLut({ preset: 'custom', path: lutPath, name: fileName(lutPath) })
+  }
   if (!hasMedia) return <aside><div className="settings-empty"><Settings2/><h2>暂无设置</h2><p>拖入视频或音频后显示对应选项</p></div></aside>
   return <aside>
     <div className="aside-title"><Settings2/><h2>导出设置</h2></div>
@@ -1161,12 +1236,21 @@ function ExportPanelV2({ settings, setSettings, current, updateCurrent, updateTr
       <div className="save-options"><button className={settings.saveMode === 'ask' ? 'on' : ''} onClick={() => set({ saveMode: 'ask' })}>每次导出时选择</button><button className={settings.saveMode === 'folder' ? 'on' : ''} onClick={() => set({ saveMode: 'folder' })}>使用默认文件夹</button></div>
       {settings.saveMode === 'folder' && <button className="folder" onClick={() => api.chooseOutputDir().then(path => path && set({ outputDir: path }))}><FolderOpen/><span>{settings.outputDir || '选择默认文件夹'}</span></button>}
     </Field>}
+    {hasMedia && <Field label="文件名设置">
+      <div className="save-options"><button className={settings.namingMode === 'firstClip' ? 'on' : ''} onClick={() => set({ namingMode: 'firstClip' })}>按首个片段名字</button><button className={settings.namingMode === 'timeline' ? 'on' : ''} onClick={() => set({ namingMode: 'timeline' })}>按时间轴名字导出</button></div>
+    </Field>}
     {hasVideo && <section className="settings-group video-settings-group">
       <h3 className="settings-section"><Video/>视频设置</h3>
       <Field label="画幅比例">
         <div className="seg">{[['original', '原始'], ['16:9', '16:9'], ['9:16', '9:16'], ['1:1', '1:1']].map(([value, label]) => <button key={value} className={settings.ratio === value ? 'on' : ''} onClick={() => set({ ratio: value })}>{label}</button>)}</div>
         {settings.ratio !== 'original' && <div className="ratio-mode"><button className={settings.ratioMode === 'pad' ? 'on' : ''} onClick={() => set({ ratioMode: 'pad' })}>黑边填充</button><button className={settings.ratioMode === 'crop' ? 'on' : ''} onClick={() => set({ ratioMode: 'crop' })}>缩放填充</button></div>}
       </Field>
+      <Field label="LUT">
+        <div className="setting-scope"><button className={settings.lutScope === 'selected' ? 'on' : ''} onClick={() => set({ lutScope: 'selected' })}>应用选中片段</button><button className={settings.lutScope === 'all' ? 'on' : ''} onClick={() => set({ lutScope: 'all' })}>应用所有片段</button></div>
+        <div className="lut-row"><select value={selectedLut.preset} onChange={event => applyLut({ preset: event.target.value, path: '', name: event.target.selectedOptions[0].text })}><option value="none">无</option><option value="sony-slog3">Sony S-Log3 / S-Gamut3.Cine → Rec.709</option><option value="sony-slog2">Sony S-Log2 / S-Gamut → Rec.709</option><option value="panasonic-vlog">Panasonic V-Log / V-Gamut → V-709</option>{selectedLut.preset === 'custom' && <option value="custom">自定义 LUT</option>}</select><button className="lut-file" onClick={chooseCustomLut}>选择 .cube</button></div>
+        {selectedLut.preset === 'custom' && <div className="lut-name">{selectedLut.name || selectedLut.path}</div>}
+      </Field>
+      <div className="setting-scope"><button className={settings.transformScope === 'selected' ? 'on' : ''} onClick={() => set({ transformScope: 'selected' })}>缩放旋转：选中片段</button><button className={settings.transformScope === 'all' ? 'on' : ''} onClick={() => set({ transformScope: 'all' })}>缩放旋转：所有片段</button></div>
       <Field label="当前片段缩放" hint={`${transform.scale}%`}>
         <input disabled={!current || current.mediaType !== 'video'} type="range" min="50" max="300" step="5" value={transform.scale} onChange={event => updateTransform({ scale: +event.target.value })}/>
       </Field>
@@ -1186,10 +1270,12 @@ function ExportPanelV2({ settings, setSettings, current, updateCurrent, updateTr
       <h3 className="settings-section"><Music2/>音频设置</h3>
       {current && <Field label="当前片段音量"><DbControl value={current.gainDb ?? 0} onChange={gainDb => updateCurrent({ gainDb })}/></Field>}
       <Field label="全部音频总音量"><DbControl value={settings.masterGainDb ?? 0} onChange={masterGainDb => set({ masterGainDb })}/></Field>
-      <label className="normalize"><input type="checkbox" checked={settings.normalizeAudio} onChange={event => set({ normalizeAudio: event.target.checked })}/><span>使用 EBU R128 测量算法，目标 {settings.loudnessTarget} LUFS</span></label>
-      {settings.normalizeAudio && <div className="loudness-options"><button className={settings.loudnessTarget === -23 ? 'on' : ''} onClick={() => set({ loudnessTarget: -23 })}><b>-23 LUFS</b><span>电视广播</span></button><button className={settings.loudnessTarget === -16 ? 'on' : ''} onClick={() => set({ loudnessTarget: -16 })}><b>-16 LUFS</b><span>网络视频</span></button></div>}
+      <Field label="统一响度">
+        <label className="normalize"><input type="checkbox" checked={settings.normalizeAudio} onChange={event => set({ normalizeAudio: event.target.checked })}/><span>使用 EBU R128 测量算法，目标 {settings.loudnessTarget} LUFS</span></label>
+        {settings.normalizeAudio && <div className="loudness-options"><button className={settings.loudnessTarget === -23 ? 'on' : ''} onClick={() => set({ loudnessTarget: -23 })}><b>-23 LUFS</b><span>电视广播</span></button><button className={settings.loudnessTarget === -16 ? 'on' : ''} onClick={() => set({ loudnessTarget: -16 })}><b>-16 LUFS</b><span>网络视频</span></button></div>}
+      </Field>
       <div className="audio-row"><select value={settings.audioFormat} onChange={event => set({ audioFormat: event.target.value })}><option value="mp3">MP3</option><option value="wav">WAV</option><option value="m4a">M4A</option></select><select value={settings.audioBitrate} onChange={event => set({ audioBitrate: +event.target.value })}><option value="128">128 kbps</option><option value="192">192 kbps</option><option value="320">320 kbps</option></select></div>
-      <button className="audio-export" disabled={exporting} onClick={() => doExport('audio')}><Music2/>按时间轴导出</button>
+      <button className="audio-export" disabled={exporting} onClick={() => doExport('audio')}><Music2/>声音导出</button>
     </section>}
     {exporting && <div className="progress"><div><span>正在处理…</span><b>{progress}%</b></div><i><em style={{ width: `${progress}%` }}/></i><button onClick={() => api.cancelExport()}>取消导出</button></div>}
   </aside>
