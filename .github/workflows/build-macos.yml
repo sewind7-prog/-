@@ -1,0 +1,79 @@
+name: 构建 macOS 安装包
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - electron/**
+      - src/**
+      - .github/workflows/build-macos.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            label: Apple-Silicon
+          - runner: macos-15-intel
+            arch: x64
+            label: Intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建网页资源
+        run: pnpm exec vite build
+
+      - name: 生成 DMG
+        run: pnpm exec electron-builder --mac dmg --${{ matrix.arch }} --publish never
+
+      - name: 挂载并验证安装包
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_path="$(find dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          hdiutil verify "$dmg_path"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach "$dmg_path" -nobrowse -mountpoint "$mount_dir"
+          test -d "$mount_dir/剪影工坊.app"
+          test -f "$mount_dir/剪影工坊.app/Contents/Resources/app.asar"
+          test -x "$mount_dir/剪影工坊.app/Contents/Resources/ffmpeg"
+          "$mount_dir/剪影工坊.app/Contents/Resources/ffmpeg" -version
+          hdiutil detach "$mount_dir"
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: 剪影工坊-1.0.0-macOS-${{ matrix.label }}
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 30

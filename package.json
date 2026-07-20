@@ -49,7 +49,14 @@
         "dmg"
       ],
       "category": "public.app-category.video",
-      "artifactName": "剪影工坊-${version}-macOS.${ext}"
+      "artifactName": "剪影工坊-${version}-macOS-${arch}.${ext}",
+      "identity": null,
+      "extraResources": [
+        {
+          "from": "node_modules/ffmpeg-static/ffmpeg",
+          "to": "ffmpeg"
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
