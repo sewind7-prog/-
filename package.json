@@ -53,7 +53,7 @@
       "identity": null,
       "extraResources": [
         {
-          "from": "node_modules/ffmpeg-static/ffmpeg",
+          "from": "ffmpeg-macos",
           "to": "ffmpeg"
         }
       ]

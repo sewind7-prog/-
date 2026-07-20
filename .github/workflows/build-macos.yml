@@ -52,6 +52,11 @@ jobs:
       - name: 构建网页资源
         run: pnpm exec vite build
 
+      - name: 准备 macOS FFmpeg
+        run: |
+          node -e "const fs=require('fs'); const source=require('@ffmpeg-installer/ffmpeg').path; fs.copyFileSync(source, 'ffmpeg-macos'); fs.chmodSync('ffmpeg-macos', 0o755); console.log(source)"
+          ./ffmpeg-macos -version
+
       - name: 生成 DMG
         # 26.15.3 发布包错误地依赖了缺少 ElectronDownloadCacheMode 的
         # @electron/get 3.x；macOS 下载 Electron 时会在真正打包前崩溃。
@@ -74,7 +79,9 @@ jobs:
           test -n "$app_path"
           test -d "$app_path"
           test -f "$app_path/Contents/Resources/app.asar"
+          echo "app.asar 验证通过"
           test -x "$app_path/Contents/Resources/ffmpeg"
+          echo "FFmpeg 可执行权限验证通过"
           "$app_path/Contents/Resources/ffmpeg" -version
           hdiutil detach "$mount_dir"
           trap - EXIT
