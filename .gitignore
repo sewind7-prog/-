@@ -1,0 +1,10 @@
+node_modules/
+dist/
+release/
+.version-guard/
+.test-media/
+.pnpm-store/
+.docx-qa/
+*.log
+.DS_Store
+.packaging-staging/
