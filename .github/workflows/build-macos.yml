@@ -68,8 +68,11 @@ jobs:
           mount_dir="$(mktemp -d)"
           trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true' EXIT
           hdiutil attach "$dmg_path" -nobrowse -mountpoint "$mount_dir"
-          app_path="$(find "$mount_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          sleep 2
+          ls -la "$mount_dir"
+          app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
           test -n "$app_path"
+          test -d "$app_path"
           test -f "$app_path/Contents/Resources/app.asar"
           test -x "$app_path/Contents/Resources/ffmpeg"
           "$app_path/Contents/Resources/ffmpeg" -version
@@ -77,6 +80,7 @@ jobs:
           trap - EXIT
 
       - name: 上传安装包
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: 剪影工坊-1.0.0-macOS-${{ matrix.label }}
