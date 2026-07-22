@@ -17,18 +17,8 @@ permissions:
 
 jobs:
   build-macos:
-    name: macOS ${{ matrix.label }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-            label: Apple-Silicon
-          - runner: macos-15-intel
-            arch: x64
-            label: Intel
-    runs-on: ${{ matrix.runner }}
+    name: macOS Apple-Silicon
+    runs-on: macos-15
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
@@ -61,7 +51,7 @@ jobs:
         # 26.15.3 发布包错误地依赖了缺少 ElectronDownloadCacheMode 的
         # @electron/get 3.x；macOS 下载 Electron 时会在真正打包前崩溃。
         # 使用已验证的稳定构建器版本，应用本身的 Electron 版本保持不变。
-        run: pnpm dlx electron-builder@26.0.12 --mac dmg --${{ matrix.arch }} --publish never
+        run: pnpm dlx electron-builder@26.0.12 --mac dmg --arm64 --publish never
 
       - name: 挂载并验证安装包
         shell: bash
@@ -90,7 +80,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: 剪影工坊-1.0.0-macOS-${{ matrix.label }}
+          name: 剪影工坊-v1.53-macOS-Apple-Silicon
           path: dist/*.dmg
           if-no-files-found: error
           retention-days: 30
